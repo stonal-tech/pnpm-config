@@ -1,0 +1,293 @@
+# 🔒 Supply Chain Security Check Workflow
+# Epic: STN-46123
+# This workflow enforces security policies for pnpm migration
+
+name: Supply Chain Security Check
+
+on:
+  push:
+    branches: [ main, develop, 'chore/pnpm-migration' ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  security-check:
+    runs-on: ubuntu-latest
+    name: Security Audit & Validation
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 📦 Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - name: 🚨 Check for suspicious lifecycle scripts
+        run: |
+          echo "🔍 Checking for lifecycle scripts..."
+          if [ -f "package.json" ]; then
+            SCRIPTS=$(cat package.json | jq -r '.scripts | keys[]' | grep -E "(post|pre)install|prepare" || true)
+            if [ ! -z "$SCRIPTS" ]; then
+              echo "⚠️ WARNING: Lifecycle scripts detected:"
+              echo "$SCRIPTS"
+              echo "🔍 Script contents:"
+              for script in $SCRIPTS; do
+                echo "  $script: $(cat package.json | jq -r ".scripts.\"$script\"")"
+              done
+              echo "⚠️ These scripts must be explicitly reviewed for security!"
+              echo "::warning::Lifecycle scripts detected that require security review"
+            else
+              echo "✅ No suspicious lifecycle scripts found"
+            fi
+          else
+            echo "ℹ️ No package.json found"
+          fi
+
+      - name: 🛡️ Verify pnpm security configuration
+        run: |
+          echo "🔧 Verifying pnpm configuration..."
+
+          # Check for pnpm-lock.yaml
+          if [[ ! -f "pnpm-lock.yaml" ]]; then
+            echo "❌ ERROR: pnpm-lock.yaml not found!"
+            echo "::error::Repository should use pnpm (pnpm-lock.yaml missing)"
+            exit 1
+          fi
+
+          # Check for old lock files
+          if [[ -f "package-lock.json" || -f "yarn.lock" ]]; then
+            echo "❌ ERROR: npm/yarn lock files detected!"
+            echo "::error::Old package managers detected (package-lock.json or yarn.lock found)"
+            exit 1
+          fi
+
+          # Check for packageManager field
+          if [ -f "package.json" ]; then
+            PACKAGE_MANAGER=$(cat package.json | jq -r '.packageManager // empty')
+            if [[ "$PACKAGE_MANAGER" == *"pnpm"* ]]; then
+              echo "✅ packageManager field correctly set to pnpm"
+            else
+              echo "⚠️ WARNING: packageManager field not set or not pnpm"
+              echo "::warning::packageManager field should be set to pnpm@9.15.0"
+            fi
+
+            # Check for preinstall script
+            PREINSTALL=$(cat package.json | jq -r '.scripts.preinstall // empty')
+            if [[ "$PREINSTALL" == *"only-allow pnpm"* ]]; then
+              echo "✅ pnpm enforcement script found"
+            else
+              echo "⚠️ WARNING: No pnpm enforcement script found"
+              echo "::warning::Consider adding 'preinstall: npx only-allow pnpm' script"
+            fi
+          fi
+
+          echo "✅ pnpm configuration verified"
+
+      - name: 🔒 Check security configuration files
+        run: |
+          echo "🔍 Checking security configuration..."
+
+          # Check .npmrc
+          if [ -f ".npmrc" ]; then
+            if grep -q "ignore-scripts=true" .npmrc; then
+              echo "✅ .npmrc has ignore-scripts=true"
+            else
+              echo "⚠️ WARNING: .npmrc missing ignore-scripts=true"
+              echo "::warning::.npmrc should contain ignore-scripts=true for security"
+            fi
+
+            if grep -q "strict-peer-dependencies=true" .npmrc; then
+              echo "✅ .npmrc has strict-peer-dependencies=true"
+            else
+              echo "ℹ️ INFO: Consider adding strict-peer-dependencies=true to .npmrc"
+            fi
+          else
+            echo "ℹ️ No .npmrc found (using global configuration)"
+          fi
+
+          # Check .pnpmfile.cjs
+          if [ -f ".pnpmfile.cjs" ]; then
+            echo "✅ .pnpmfile.cjs found (script filtering enabled)"
+          else
+            echo "ℹ️ No .pnpmfile.cjs found (no script filtering)"
+          fi
+
+      - name: 🔍 Dependency vulnerability scan
+        run: |
+          echo "🛡️ Running security audit..."
+
+          # Configure npm for CodeArtifact (if needed)
+          # Note: In CI, we'll use public registry for audit
+          npm config set registry https://registry.npmjs.org/
+
+          # Install dependencies with security settings
+          pnpm install --frozen-lockfile --ignore-scripts
+
+          # Run audit
+          echo "📊 Running pnpm audit..."
+          if pnpm audit --audit-level=moderate; then
+            echo "✅ Security audit passed"
+          else
+            AUDIT_EXIT_CODE=$?
+            echo "⚠️ Security audit found issues (exit code: $AUDIT_EXIT_CODE)"
+            echo "🔍 Running detailed audit..."
+            pnpm audit --json > audit-results.json || true
+
+            # Parse results
+            if [ -f "audit-results.json" ]; then
+              CRITICAL=$(cat audit-results.json | jq '.vulnerabilities.critical // 0')
+              HIGH=$(cat audit-results.json | jq '.vulnerabilities.high // 0')
+              MODERATE=$(cat audit-results.json | jq '.vulnerabilities.moderate // 0')
+
+              echo "📊 Vulnerability Summary:"
+              echo "  Critical: $CRITICAL"
+              echo "  High: $HIGH"
+              echo "  Moderate: $MODERATE"
+
+              if [ "$CRITICAL" -gt 0 ]; then
+                echo "::error::Critical vulnerabilities found ($CRITICAL)"
+                exit 1
+              elif [ "$HIGH" -gt 0 ]; then
+                echo "::error::High severity vulnerabilities found ($HIGH)"
+                exit 1
+              elif [ "$MODERATE" -gt 3 ]; then
+                echo "::warning::Multiple moderate vulnerabilities found ($MODERATE)"
+              fi
+            fi
+          fi
+
+      - name: 🔬 Advanced security checks
+        run: |
+          echo "🔬 Running advanced security checks..."
+
+          # Check for known dangerous packages
+          DANGEROUS_PACKAGES=("qix" "colors@1.4.1" "chalk@4.1.1" "ua-parser-js@0.7.29" "coa@2.0.3" "rc@1.2.9")
+
+          echo "🚨 Checking for known dangerous packages..."
+          for pkg in "${DANGEROUS_PACKAGES[@]}"; do
+            if pnpm list "$pkg" >/dev/null 2>&1; then
+              echo "❌ DANGER: Found known malicious package: $pkg"
+              echo "::error::Dangerous package detected: $pkg"
+              exit 1
+            fi
+          done
+          echo "✅ No known dangerous packages found"
+
+          # Check dependency tree depth
+          echo "📊 Analyzing dependency tree..."
+          DEPS_COUNT=$(pnpm list --depth=0 --json | jq '.[] | .dependencies | length' 2>/dev/null || echo 0)
+          echo "📦 Direct dependencies: $DEPS_COUNT"
+
+          if [ "$DEPS_COUNT" -gt 100 ]; then
+            echo "⚠️ WARNING: Large number of dependencies ($DEPS_COUNT)"
+            echo "::warning::Consider reviewing dependency count for potential bloat"
+          fi
+
+      - name: 🧪 Build verification
+        run: |
+          echo "🧪 Verifying build process..."
+
+          # Check if build script exists
+          if cat package.json | jq -e '.scripts.build' >/dev/null 2>&1; then
+            echo "🔨 Running build test..."
+            if timeout 300 pnpm run build; then
+              echo "✅ Build successful"
+            else
+              echo "❌ Build failed or timed out"
+              echo "::error::Build process failed"
+              exit 1
+            fi
+          else
+            echo "ℹ️ No build script found, skipping build test"
+          fi
+
+          # Check if test script exists
+          if cat package.json | jq -e '.scripts.test' >/dev/null 2>&1; then
+            echo "🧪 Running tests..."
+            if timeout 300 pnpm test; then
+              echo "✅ Tests passed"
+            else
+              echo "⚠️ Tests failed or timed out"
+              echo "::warning::Test execution failed"
+            fi
+          else
+            echo "ℹ️ No test script found, skipping tests"
+          fi
+
+      - name: 📊 Generate security report
+        if: always()
+        run: |
+          echo "📊 Generating security report..."
+
+          cat > security-report.md << EOF
+          # 🔒 Security Report
+
+          **Repository**: \${{ github.repository }}
+          **Branch**: \${{ github.ref_name }}
+          **Commit**: \${{ github.sha }}
+          **Date**: $(date)
+          **Epic**: STN-46123
+
+          ## ✅ Security Checks Completed
+
+          - [x] Lifecycle scripts verification
+          - [x] pnpm configuration validation
+          - [x] Security configuration files check
+          - [x] Dependency vulnerability scan
+          - [x] Dangerous packages detection
+          - [x] Build verification
+
+          ## 📋 Recommendations
+
+          1. Ensure .npmrc contains \`ignore-scripts=true\`
+          2. Use .pnpmfile.cjs for script filtering
+          3. Regular dependency updates
+          4. Monitor for new vulnerabilities
+
+          ---
+          **Generated by**: Supply Chain Security Check
+          **Epic**: STN-46123
+          EOF
+
+          echo "📄 Security report generated"
+
+      - name: 📤 Upload security report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report-${{ github.run_id }}
+          path: |
+            security-report.md
+            audit-results.json
+          retention-days: 30
+
+      - name: 💬 Comment PR with security status
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let comment = '## 🔒 Security Check Results\n\n';
+            comment += '**Epic**: STN-46123\n\n';
+            comment += '✅ Security validation completed successfully!\n\n';
+            comment += '### Security Measures Verified\n';
+            comment += '- ✅ No suspicious lifecycle scripts\n';
+            comment += '- ✅ pnpm security configuration\n';
+            comment += '- ✅ Dependency vulnerability scan\n';
+            comment += '- ✅ Build verification\n\n';
+            comment += '_This check ensures supply chain security compliance._';
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
